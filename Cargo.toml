@@ -1,0 +1,11 @@
+[package]
+name = "dvpn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.9", features = ["derive"] }
+derive_more = { version = "0.99.18" }
+inquire = "0.7.5"
+tabled = "0.15.0"
+tokio = { version = "1.38.1", features = ["macros", "net", "rt-multi-thread"] }
