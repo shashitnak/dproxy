@@ -1,25 +1,16 @@
-extern crate alloc;
 mod error;
+mod p2p;
+mod socks5;
 
 use error::Result;
-
-use alloc::borrow::Cow;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::result::Result as CoreResult;
-use std::sync::Arc;
+use p2p::{NetworkCommand, NetworkEvent, P2PNetwork, PeerManager};
+use socks5::Socks5Server;
 
 use clap::{Parser, Subcommand};
-use http::request::Request;
-use http_body::Body;
-use inquire::Select;
-use reqwest::header::{HeaderMap, HeaderName};
-use rustls_pki_types::ServerName;
+use inquire::{Confirm, Select};
+use std::net::SocketAddr;
 use tabled::{Table, Tabled};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
-use tokio_util::io::ReaderStream;
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Decentralized VPN", long_about = None)]
@@ -30,161 +21,304 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Mode {
-    Serve(Serve),
-    Connect(Connect),
+    /// Start the VPN node (join the network and serve)
+    Start(Start),
+    /// List available peers
     List,
+    /// Connect to a peer (route traffic through them)
+    Connect(Connect),
+    /// View and manage routing requests
+    Requests,
 }
 
 #[derive(Parser, Debug)]
-struct Serve {
-    #[arg(short, long, default_value = "4202")]
-    port: u16,
-}
+struct Start {
+    /// Port for P2P networking
+    #[arg(short = 'p', long, default_value = "4202")]
+    p2p_port: u16,
 
-async fn proxy_handler(stream: TcpStream, addr: SocketAddr) -> Result<()> {
-    let mut stream = BufReader::new(stream);
-    let mut payload = vec![];
-    stream.read_until(b'\n', &mut payload).await?;
-    let mut payload = vec![];
-    let mut start = 0;
+    /// Port for SOCKS5 proxy
+    #[arg(short = 's', long, default_value = "1080")]
+    socks_port: u16,
 
-    let mut upstream = loop {
-        let name_len = stream.read_until(b':', &mut payload).await?;
-        let value_len = stream.read_until(b'\r', &mut payload).await?;
-
-        let offset = stream.read_until(b'\n', &mut payload).await?;
-
-        let name = &payload[start..start + name_len - 1];
-        let name = std::str::from_utf8(name).unwrap();
-
-        let value = &payload[start + name_len + 1..start + name_len + value_len - 1];
-        let value = std::str::from_utf8(value).unwrap();
-
-        start += name_len + value_len + offset;
-        println!("Name({name:?})");
-        println!("Value({value:?})");
-
-        if name.to_lowercase() == "host" {
-            let value = value.split(':').next().unwrap();
-            println!("here {value:?}");
-            let addr = dns_lookup::lookup_host(value)?
-                .pop()
-                .ok_or("dns lookup failed")?;
-
-            let mut root_cert_store = RootCertStore::empty();
-            root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
-            let connector = TlsConnector::from(Arc::new(config));
-            let dnsname = ServerName::try_from(value.to_string()).unwrap();
-
-            let stream = TcpStream::connect((addr, 443)).await?;
-            let mut stream = connector.connect(dnsname, stream).await?;
-            break stream;
-        }
-    };
-
-    upstream.write_all(&payload).await?;
-    let mut buffer = vec![];
-    let bytes = upstream.read(&mut buffer).await?;
-    println!("{}", std::str::from_utf8(&buffer).unwrap());
-
-    if !stream.buffer().is_empty() {
-        upstream.write_all(stream.buffer()).await?;
-    }
-
-    //let mut stream = stream.into_inner();
-    //tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
-
-    Ok(())
-}
-
-impl Serve {
-    async fn handle(&self) -> Result<()> {
-        let listener = TcpListener::bind(("0.0.0.0", self.port)).await?;
-        println!("Listening on 0.0.0.0:{}", self.port);
-
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            tokio::spawn(async move {
-                if let Err(err) = proxy_handler(stream, dbg!(addr)).await {
-                    println!("{err:?}");
-                }
-            });
-        }
-
-        Ok(())
-    }
+    /// Region identifier
+    #[arg(short = 'r', long, default_value = "unknown")]
+    region: String,
 }
 
 #[derive(Parser, Debug)]
 struct Connect {
+    /// Optional region filter
     #[arg(short, long)]
     region: Option<String>,
 }
 
-impl Connect {
+#[derive(Debug, Clone, Tabled)]
+struct PeerDisplay {
+    #[tabled(rename = "Peer ID")]
+    peer_id: String,
+    #[tabled(rename = "Region")]
+    region: String,
+    #[tabled(rename = "Available Slots")]
+    slots: u32,
+    #[tabled(rename = "Status")]
+    status: String,
+}
+
+impl Start {
     async fn handle(&self) -> Result<()> {
-        let mut peers = peers()?;
-        if let Some(region) = self.region.as_ref() {
-            peers.retain(|peer| &peer.region == region);
+        println!("🚀 Starting Decentralized VPN Node...");
+        println!("   P2P Port: {}", self.p2p_port);
+        println!("   SOCKS5 Port: {}", self.socks_port);
+        println!("   Region: {}\n", self.region);
+
+        let peer_manager = PeerManager::new();
+        let peer_manager_clone = peer_manager.clone();
+
+        // Create P2P network
+        let (mut network, command_tx, mut event_rx) =
+            P2PNetwork::new(self.region.clone(), peer_manager.clone())
+                .await
+                .map_err(|e| format!("Failed to create P2P network: {}", e))?;
+
+        // Start listening on P2P port
+        network
+            .listen(self.p2p_port)
+            .map_err(|e| format!("Failed to start P2P listener: {}", e))?;
+
+        // Start SOCKS5 proxy
+        let socks_addr = format!("127.0.0.1:{}", self.socks_port);
+        let mut socks_server = Socks5Server::new(&socks_addr)
+            .await
+            .map_err(|e| format!("Failed to start SOCKS5 server: {:?}", e))?;
+
+        println!("✅ Node is running!");
+        println!("   Configure your applications to use SOCKS5 proxy: {}\n", socks_addr);
+        println!("📡 Discovering peers...\n");
+
+        // Spawn P2P network task
+        tokio::spawn(async move {
+            network.run().await;
+        });
+
+        // Spawn SOCKS5 proxy task
+        tokio::spawn(async move {
+            if let Err(e) = socks_server.run().await {
+                eprintln!("SOCKS5 server error: {:?}", e);
+            }
+        });
+
+        // Handle network events
+        let command_tx_clone = command_tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    NetworkEvent::PeerDiscovered { peer_id, region } => {
+                        println!("🔍 Discovered peer: {} ({})", peer_id, region);
+                    }
+                    NetworkEvent::PeerDisconnected { peer_id } => {
+                        println!("👋 Peer disconnected: {}", peer_id);
+                    }
+                    NetworkEvent::RouteRequestReceived {
+                        request_id,
+                        peer_id,
+                        peer_name,
+                    } => {
+                        println!("\n📥 Routing request received!");
+                        println!("   From: {} ({})", peer_name, peer_id);
+                        println!("   Request ID: {}", request_id);
+                        println!("   Use 'dvpn requests' to view and approve/deny\n");
+                    }
+                    NetworkEvent::RouteResponseReceived {
+                        request_id,
+                        approved,
+                    } => {
+                        if approved {
+                            println!("✅ Routing request approved! (ID: {})", request_id);
+                            println!("   Your traffic will now be routed through the peer.\n");
+                        } else {
+                            println!("❌ Routing request denied. (ID: {})\n", request_id);
+                        }
+                    }
+                    NetworkEvent::MessageReceived { from, message } => {
+                        println!("💬 Message from {}: {}", from, message);
+                    }
+                }
+            }
+        });
+
+        // Keep the main thread alive
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+            // Show peer count periodically
+            let peers = peer_manager_clone.get_peers().await;
+            if !peers.is_empty() {
+                println!("📊 Connected peers: {}", peers.len());
+            }
         }
-        let peer = Select::new("Select the node you would like to use", peers).prompt()?;
-        println!("Connecting to {peer:?}...");
-        peer.connect();
+    }
+}
+
+impl Connect {
+    async fn handle(&self, peer_manager: PeerManager, command_tx: mpsc::UnboundedSender<NetworkCommand>) -> Result<()> {
+        // Get list of peers
+        let mut peers = peer_manager.get_peers().await;
+
+        if peers.is_empty() {
+            println!("❌ No peers available. Make sure a node is running with 'dvpn start'");
+            return Ok(());
+        }
+
+        // Filter by region if specified
+        if let Some(region) = &self.region {
+            peers.retain(|p| p.region.contains(region));
+            if peers.is_empty() {
+                println!("❌ No peers found in region: {}", region);
+                return Ok(());
+            }
+        }
+
+        // Display peers
+        let peer_displays: Vec<PeerDisplay> = peers
+            .iter()
+            .map(|p| PeerDisplay {
+                peer_id: p.peer_id.to_string()[..16].to_string(),
+                region: p.region.clone(),
+                slots: p.available_slots,
+                status: if p.is_routing_through {
+                    "Active".to_string()
+                } else {
+                    "Available".to_string()
+                },
+            })
+            .collect();
+
+        println!("\n📋 Available Peers:\n");
+        println!("{}\n", Table::new(&peer_displays));
+
+        // Select peer
+        let options: Vec<String> = peers
+            .iter()
+            .map(|p| format!("{} - {} ({})", &p.peer_id.to_string()[..16], p.region, p.available_slots))
+            .collect();
+
+        let selection = Select::new("Select a peer to route through:", options)
+            .prompt()
+            .map_err(|e| format!("Selection error: {}", e))?;
+
+        let selected_idx = options
+            .iter()
+            .position(|x| x == &selection)
+            .ok_or("Invalid selection")?;
+        let selected_peer = &peers[selected_idx];
+
+        println!("\n📤 Sending routing request to peer...");
+
+        // Send route request
+        command_tx
+            .send(NetworkCommand::SendRouteRequest {
+                target_peer: selected_peer.peer_id.to_string(),
+                requester_name: "User".to_string(),
+            })
+            .map_err(|e| format!("Failed to send route request: {}", e))?;
+
+        println!("✅ Request sent! Waiting for approval...");
+        println!("   The peer will receive a notification and can approve/deny your request.\n");
+
         Ok(())
     }
 }
 
-#[derive(Debug)]
-struct Peer {
-    ip_addr: IpAddr,
-    region: String,
-}
+async fn handle_requests(peer_manager: PeerManager, command_tx: mpsc::UnboundedSender<NetworkCommand>) -> Result<()> {
+    let requests = peer_manager.get_pending_requests().await;
 
-impl std::fmt::Display for Peer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> CoreResult<(), std::fmt::Error> {
-        write!(f, "IP: {}, Region: {}", &self.ip_addr, &self.region)
-    }
-}
-
-impl Tabled for Peer {
-    const LENGTH: usize = 2;
-
-    fn fields(&self) -> Vec<Cow<'_, str>> {
-        vec![
-            Cow::Owned(self.ip_addr.to_string()),
-            Cow::Owned(self.region.clone()),
-        ]
+    if requests.is_empty() {
+        println!("📭 No pending routing requests.\n");
+        return Ok(());
     }
 
-    fn headers() -> Vec<Cow<'static, str>> {
-        vec![Cow::Borrowed("ip_addr"), Cow::Borrowed("region")]
+    println!("\n📬 Pending Routing Requests:\n");
+
+    for request in &requests {
+        println!("┌─────────────────────────────────────────────");
+        println!("│ Request ID: {}", request.request_id);
+        println!("│ From: {} ({})", request.peer_name, request.peer_id);
+        println!("│ Time: {}", request.timestamp.format("%Y-%m-%d %H:%M:%S"));
+        println!("└─────────────────────────────────────────────\n");
+
+        let approve = Confirm::new("Approve this routing request?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| format!("Prompt error: {}", e))?;
+
+        // Send response
+        command_tx
+            .send(NetworkCommand::SendRouteResponse {
+                request_id: request.request_id.clone(),
+                approved: approve,
+            })
+            .map_err(|e| format!("Failed to send response: {}", e))?;
+
+        // Remove from pending
+        peer_manager.remove_routing_request(&request.request_id).await;
+
+        if approve {
+            println!("✅ Request approved!\n");
+            // Set active route
+            peer_manager.set_active_route(Some(request.peer_id)).await;
+        } else {
+            println!("❌ Request denied.\n");
+        }
     }
+
+    Ok(())
 }
 
-impl Peer {
-    fn connect(&self) -> Option<()> {
-        todo!()
-    }
-}
+async fn handle_list(peer_manager: PeerManager) -> Result<()> {
+    let peers = peer_manager.get_peers().await;
 
-fn peers() -> Result<Vec<Peer>> {
-    Ok(vec![Peer {
-        ip_addr: "127.0.0.1".parse::<Ipv4Addr>()?.into(),
-        region: "India".into(),
-    }])
+    if peers.is_empty() {
+        println!("❌ No peers discovered yet. Start a node with 'dvpn start'\n");
+        return Ok(());
+    }
+
+    let peer_displays: Vec<PeerDisplay> = peers
+        .iter()
+        .map(|p| PeerDisplay {
+            peer_id: p.peer_id.to_string()[..16].to_string(),
+            region: p.region.clone(),
+            slots: p.available_slots,
+            status: if p.is_routing_through {
+                "Active".to_string()
+            } else {
+                "Available".to_string()
+            },
+        })
+        .collect();
+
+    println!("\n📋 Discovered Peers:\n");
+    println!("{}\n", Table::new(&peer_displays));
+
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
     match args.mode {
-        Mode::Serve(serve) => serve.handle().await,
-        Mode::Connect(connect) => connect.handle().await,
+        Mode::Start(start) => start.handle().await,
         Mode::List => {
-            println!("{}", Table::new(peers()?));
+            println!("❌ This command requires a running node. Use 'dvpn start' first.\n");
+            Ok(())
+        }
+        Mode::Connect(_) => {
+            println!("❌ This command requires a running node. Use 'dvpn start' first.\n");
+            Ok(())
+        }
+        Mode::Requests => {
+            println!("❌ This command requires a running node. Use 'dvpn start' first.\n");
             Ok(())
         }
     }
